@@ -1,0 +1,14 @@
+node_modules
+.git
+.env
+.env.*
+dist
+out
+coverage
+*.md
+*.log
+.eslintcache
+.cache
+*.tsbuildinfo
+.idea
+.DS_Store
