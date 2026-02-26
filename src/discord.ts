@@ -33,7 +33,9 @@ export async function registerCommands(clientId: string): Promise<void> {
 				.setRequired(true),
 		)
 		.addAttachmentOption((opt) =>
-			opt.setName("image").setDescription("Imagem opcional para anexar à issue"),
+			opt
+				.setName("image")
+				.setDescription("Imagem opcional para anexar à issue"),
 		);
 	await rest.put(Routes.applicationCommands(clientId), {
 		body: [command.toJSON()],
@@ -66,7 +68,10 @@ interface IssueContext {
 
 async function handleIssueCreation(ctx: IssueContext): Promise<void> {
 	await ctx.sendTyping();
-	const decision = await analyzeContent(ctx.content);
+	const decision = await analyzeContent(
+		ctx.content,
+		ctx.imageUrls?.length ?? 0,
+	);
 
 	if (decision.action === "refuse") {
 		await ctx.sendMessage(decision.refusalReason);

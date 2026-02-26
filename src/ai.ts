@@ -47,12 +47,20 @@ const SYSTEM_PROMPT = `Crie issues no GitHub a partir do conteúdo fornecido.
 
 Campos não usados: null.`;
 
-export async function analyzeContent(content: string): Promise<Decision> {
+export async function analyzeContent(
+	content: string,
+	imageCount = 0,
+): Promise<Decision> {
+	const prompt =
+		imageCount > 0
+			? `${content}\n\n[${imageCount} imagem(ns) anexada(s) como contexto adicional]`
+			: content;
+
 	const { output: object } = await generateText({
 		model,
 		output: Output.object({ schema: decisionSchema }),
 		system: SYSTEM_PROMPT,
-		prompt: content,
+		prompt,
 	});
 
 	if (object.action === "create" && object.title && object.description) {
