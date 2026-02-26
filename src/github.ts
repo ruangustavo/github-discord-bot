@@ -13,11 +13,16 @@ const api = axios.create({
 export async function createIssue(
 	title: string,
 	body: string,
-): Promise<string> {
+	imageUrls?: string[],
+): Promise<{ url: string; number: number }> {
 	const [owner, repo] = env.GITHUB_REPO.split("/");
+	const fullBody =
+		imageUrls?.length
+			? `${body}\n\n${imageUrls.map((u) => `![image](${u})`).join("\n")}`
+			: body;
 	const response = await api.post(`/repos/${owner}/${repo}/issues`, {
 		title,
-		body,
+		body: fullBody,
 	});
-	return response.data.html_url;
+	return { url: response.data.html_url, number: response.data.number };
 }

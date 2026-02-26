@@ -31,6 +31,9 @@ export async function registerCommands(clientId: string): Promise<void> {
 				.setName("description")
 				.setDescription("Descreva o problema ou funcionalidade")
 				.setRequired(true),
+		)
+		.addAttachmentOption((opt) =>
+			opt.setName("image").setDescription("Imagem opcional para anexar à issue"),
 		);
 	await rest.put(Routes.applicationCommands(clientId), {
 		body: [command.toJSON()],
@@ -41,6 +44,7 @@ function buildSuccessEmbed(
 	title: string,
 	description: string,
 	url: string,
+	number: number,
 ): EmbedBuilder {
 	const preview =
 		description.length > 300 ? `${description.slice(0, 300)}...` : description;
@@ -48,11 +52,13 @@ function buildSuccessEmbed(
 		.setTitle(title)
 		.setDescription(preview)
 		.setURL(url)
-		.setColor(0x2da44e);
+		.setColor(0x2da44e)
+		.setFooter({ text: `Issue #${number}` });
 }
 
 interface IssueContext {
 	content: string;
+	imageUrls?: string[];
 	sendTyping: () => Promise<void>;
 	sendMessage: (text: string) => Promise<void>;
 	sendEmbed: (embed: EmbedBuilder) => Promise<void>;
@@ -67,9 +73,13 @@ async function handleIssueCreation(ctx: IssueContext): Promise<void> {
 		return;
 	}
 
-	const url = await createIssue(decision.title, decision.description);
+	const { url, number } = await createIssue(
+		decision.title,
+		decision.description,
+		ctx.imageUrls,
+	);
 	await ctx.sendEmbed(
-		buildSuccessEmbed(decision.title, decision.description, url),
+		buildSuccessEmbed(decision.title, decision.description, url, number),
 	);
 }
 
@@ -91,8 +101,16 @@ export function setupEvents(client: Client): void {
 				.filter(Boolean)
 				.join("\n");
 
+			const imageUrls = [
+				...referenced.attachments.values(),
+				...message.attachments.values(),
+			]
+				.filter((a) => a.contentType?.startsWith("image/"))
+				.map((a) => a.url);
+
 			await handleIssueCreation({
 				content,
+				imageUrls,
 				sendTyping: () => message.channel.sendTyping(),
 				sendMessage: async (text) => {
 					await message.reply({
@@ -121,10 +139,15 @@ export function setupEvents(client: Client): void {
 
 		await interaction.deferReply();
 		const content = interaction.options.getString("description", true);
+		const attachment = interaction.options.getAttachment("image");
+		const imageUrls = attachment?.contentType?.startsWith("image/")
+			? [attachment.url]
+			: [];
 
 		try {
 			await handleIssueCreation({
 				content,
+				imageUrls,
 				sendTyping: () => Promise.resolve(),
 				sendMessage: async (text) => {
 					await interaction.editReply(text);
