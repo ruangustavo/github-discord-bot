@@ -7,9 +7,8 @@ import {
 	Routes,
 	SlashCommandBuilder,
 } from "discord.js";
-import { analyzeContent } from "./ai.ts";
+import { processRequest } from "./ai.ts";
 import { env } from "./env.ts";
-import { createIssue } from "./github.ts";
 
 export function createClient(): Client {
 	return new Client({
@@ -42,7 +41,7 @@ export async function registerCommands(clientId: string): Promise<void> {
 	});
 }
 
-function buildSuccessEmbed(
+function buildIssueEmbed(
 	title: string,
 	description: string,
 	url: string,
@@ -58,62 +57,92 @@ function buildSuccessEmbed(
 		.setFooter({ text: `Issue #${number}` });
 }
 
-interface IssueContext {
+function buildCommentEmbed(
+	issueTitle: string,
+	commentUrl: string,
+	issueNumber: number,
+): EmbedBuilder {
+	return new EmbedBuilder()
+		.setTitle(issueTitle)
+		.setURL(commentUrl)
+		.setColor(0x2da44e)
+		.setFooter({ text: `Comentário adicionado na Issue #${issueNumber}` });
+}
+
+interface RequestContext {
 	content: string;
-	imageUrls?: string[];
+	imageUrls: string[];
 	sendTyping: () => Promise<void>;
 	sendMessage: (text: string) => Promise<void>;
 	sendEmbed: (embed: EmbedBuilder) => Promise<void>;
 }
 
-async function handleIssueCreation(ctx: IssueContext): Promise<void> {
+async function handleRequest(ctx: RequestContext): Promise<void> {
 	await ctx.sendTyping();
-	const decision = await analyzeContent(
-		ctx.content,
-		ctx.imageUrls?.length ?? 0,
-	);
-
-	if (decision.action === "refuse") {
-		await ctx.sendMessage(decision.refusalReason);
-		return;
+	const result = await processRequest(ctx.content, ctx.imageUrls);
+	switch (result.type) {
+		case "issue_created":
+			await ctx.sendEmbed(
+				buildIssueEmbed(result.title, result.description, result.url, result.number),
+			);
+			break;
+		case "comment_added":
+			await ctx.sendEmbed(
+				buildCommentEmbed(result.issueTitle, result.url, result.issueNumber),
+			);
+			break;
+		case "refused":
+			await ctx.sendMessage(result.reason);
+			break;
 	}
-
-	const { url, number } = await createIssue(
-		decision.title,
-		decision.description,
-		ctx.imageUrls,
-	);
-	await ctx.sendEmbed(
-		buildSuccessEmbed(decision.title, decision.description, url, number),
-	);
 }
 
 export function setupEvents(client: Client): void {
 	client.on(Events.MessageCreate, async (message) => {
 		if (message.author.bot) return;
 		if (!message.mentions.has(client.user ?? "")) return;
-		if (!message.reference) return;
+
+		const userNote = message.content
+			.replace(`<@${client.user?.id}>`, "")
+			.trim();
+
+		let content: string;
+		const imageUrls: string[] = [];
+
+		if (message.reference) {
+			const referenced = await message.fetchReference().catch(() => null);
+			if (referenced) {
+				content = [
+					`Mensagem original: ${referenced.content}`,
+					userNote ? `Nota do usuário: ${userNote}` : null,
+				]
+					.filter(Boolean)
+					.join("\n");
+				imageUrls.push(
+					...[...referenced.attachments.values(), ...message.attachments.values()]
+						.filter((a) => a.contentType?.startsWith("image/"))
+						.map((a) => a.url),
+				);
+			} else {
+				content = userNote;
+				imageUrls.push(
+					...[...message.attachments.values()]
+						.filter((a) => a.contentType?.startsWith("image/"))
+						.map((a) => a.url),
+				);
+			}
+		} else {
+			if (!userNote) return;
+			content = userNote;
+			imageUrls.push(
+				...[...message.attachments.values()]
+					.filter((a) => a.contentType?.startsWith("image/"))
+					.map((a) => a.url),
+			);
+		}
 
 		try {
-			const referenced = await message.fetchReference();
-			const userNote = message.content
-				.replace(`<@${client.user?.id}>`, "")
-				.trim();
-			const content = [
-				`Mensagem original: ${referenced.content}`,
-				userNote ? `Nota do usuário: ${userNote}` : null,
-			]
-				.filter(Boolean)
-				.join("\n");
-
-			const imageUrls = [
-				...referenced.attachments.values(),
-				...message.attachments.values(),
-			]
-				.filter((a) => a.contentType?.startsWith("image/"))
-				.map((a) => a.url);
-
-			await handleIssueCreation({
+			await handleRequest({
 				content,
 				imageUrls,
 				sendTyping: () => message.channel.sendTyping(),
@@ -132,7 +161,7 @@ export function setupEvents(client: Client): void {
 			});
 		} catch {
 			await message.reply({
-				content: "Não foi possível criar a issue. Tente novamente.",
+				content: "Não foi possível processar a solicitação. Tente novamente.",
 				allowedMentions: { repliedUser: false },
 			});
 		}
@@ -150,7 +179,7 @@ export function setupEvents(client: Client): void {
 			: [];
 
 		try {
-			await handleIssueCreation({
+			await handleRequest({
 				content,
 				imageUrls,
 				sendTyping: () => Promise.resolve(),

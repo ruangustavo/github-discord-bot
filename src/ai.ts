@@ -1,83 +1,107 @@
 import { openai } from "@ai-sdk/openai";
-import { generateText, Output } from "ai";
+import { generateText, tool } from "ai";
 import { z } from "zod";
+import { addComment, createIssue, getIssue } from "./github.ts";
 
 const model = openai("gpt-4o-mini");
 
-const decisionSchema = z.object({
-	action: z
-		.enum(["create", "refuse"])
-		.describe(
-			"Ação a tomar: 'create' para criar a issue, 'refuse' para recusar conteúdo off-topic ou vago demais",
-		),
-	title: z
-		.string()
-		.nullable()
-		.describe(
-			"Título da issue. Obrigatório quando action='create', null caso contrário",
-		),
-	description: z
-		.string()
-		.nullable()
-		.describe(
-			"Descrição detalhada da issue em Markdown. Obrigatório quando action='create', null caso contrário",
-		),
-	refusalReason: z
-		.string()
-		.nullable()
-		.describe(
-			"Motivo da recusa. Obrigatório quando action='refuse', null caso contrário",
-		),
-});
+const SYSTEM_PROMPT = `Você é um bot de gerenciamento de issues no GitHub. Com base na mensagem do usuário, chame a ferramenta adequada:
 
-export type CreateDecision = {
-	action: "create";
-	title: string;
-	description: string;
-};
+- **create_issue**: use para QUALQUER conteúdo acionável (bug, funcionalidade, problema, dúvida, etc.). Esta é a ação PADRÃO.
+- **add_comment**: use SOMENTE quando o usuário disser EXPLICITAMENTE que quer "adicionar comentário", "comentar" ou equivalente em uma issue E fornecer o número dela.
 
-export type RefuseDecision = { action: "refuse"; refusalReason: string };
+Se o conteúdo for completamente fora do escopo ou vago demais para qualquer ação, responda apenas com texto explicando o motivo — sem chamar nenhuma ferramenta.
 
-export type Decision = CreateDecision | RefuseDecision;
+Ao criar uma issue: gere título conciso e descrição sucinta em Markdown, ambos em português. Reorganize as ideias do usuário sem expandir o escopo — não adicione contexto, sugestões ou seções que o usuário não mencionou.
+Ao adicionar comentário: escreva o corpo em Markdown em português, usando verbos no infinitivo — os comentários representam ações futuras (ex: "Adicionar suporte a X", "Corrigir comportamento Y"). Se a mensagem não tiver texto (apenas imagem), o corpo pode ser vazio ou uma frase mínima de contexto.`;
 
-const SYSTEM_PROMPT = `Crie issues no GitHub a partir do conteúdo fornecido.
+export type RequestResult =
+	| {
+			type: "issue_created";
+			title: string;
+			description: string;
+			url: string;
+			number: number;
+	  }
+	| {
+			type: "comment_added";
+			issueTitle: string;
+			url: string;
+			issueNumber: number;
+	  }
+	| { type: "refused"; reason: string };
 
-- "create": conteúdo acionável → title e description curta e objetiva em português
-- "refuse": off-topic ou vago demais → refusalReason em português
-
-Campos não usados: null.`;
-
-export async function analyzeContent(
+export async function processRequest(
 	content: string,
-	imageCount = 0,
-): Promise<Decision> {
-	const prompt =
-		imageCount > 0
-			? `${content}\n\n[${imageCount} imagem(ns) anexada(s) como contexto adicional]`
-			: content;
+	imageUrls: string[] = [],
+): Promise<RequestResult> {
+	let result: RequestResult | null = null;
 
-	const { output: object } = await generateText({
-		model,
-		output: Output.object({ schema: decisionSchema }),
-		system: SYSTEM_PROMPT,
-		prompt,
+	const imageContext =
+		imageUrls.length > 0
+			? `\n\n[${imageUrls.length} imagem(ns) anexada(s) como contexto adicional]`
+			: "";
+
+	const createIssueTool = tool({
+		description: "Cria uma nova issue no GitHub com título e descrição",
+		inputSchema: z.object({
+			title: z.string().describe("Título claro e conciso da issue"),
+			description: z
+				.string()
+				.describe("Descrição detalhada da issue em Markdown"),
+		}),
+		execute: async ({ title, description }) => {
+			const { url, number } = await createIssue(title, description, imageUrls);
+			result = { type: "issue_created", title, description, url, number };
+			return { url, number };
+		},
 	});
 
-	if (object.action === "create" && object.title && object.description) {
-		return {
-			action: "create",
-			title: object.title,
-			description: object.description,
-		};
-	}
+	const addCommentTool = tool({
+		description:
+			"Adiciona um comentário a uma issue existente no GitHub. Usar SOMENTE quando o usuário explicitamente pedir para comentar em uma issue específica.",
+		inputSchema: z.object({
+			issueNumber: z
+				.number()
+				.describe("Número da issue onde o comentário será adicionado"),
+			body: z.string().describe("Corpo do comentário em Markdown"),
+		}),
+		execute: async ({ issueNumber, body }) => {
+			const issue = await getIssue(issueNumber);
+			if (!issue) {
+				result = {
+					type: "refused",
+					reason: `A issue #${issueNumber} não foi encontrada.`,
+				};
+				return { error: "not_found" };
+			}
+			const { url } = await addComment(issueNumber, body, imageUrls);
+			result = {
+				type: "comment_added",
+				issueTitle: issue.title,
+				url,
+				issueNumber,
+			};
+			return { url };
+		},
+	});
 
-	if (object.action === "refuse" && object.refusalReason) {
-		return { action: "refuse", refusalReason: object.refusalReason };
-	}
+	const { text } = await generateText({
+		model,
+		tools: {
+			create_issue: createIssueTool,
+			add_comment: addCommentTool,
+		},
+		system: SYSTEM_PROMPT,
+		prompt: content + imageContext,
+	});
 
-	return {
-		action: "refuse",
-		refusalReason:
-			"Não consigo processar essa solicitação. Por favor, forneça mais detalhes sobre o que precisa ser feito.",
-	};
+	return (
+		result ?? {
+			type: "refused",
+			reason:
+				text ||
+				"Não consigo processar essa solicitação. Por favor, forneça mais detalhes.",
+		}
+	);
 }

@@ -10,19 +10,50 @@ const api = axios.create({
 	},
 });
 
+const [owner, repo] = env.GITHUB_REPO.split("/");
+
+function appendImages(body: string, imageUrls?: string[]): string {
+	return imageUrls?.length
+		? `${body}\n\n${imageUrls.map((u) => `![image](${u})`).join("\n")}`
+		: body;
+}
+
+export async function getIssue(
+	issueNumber: number,
+): Promise<{ title: string; url: string } | null> {
+	try {
+		const response = await api.get(
+			`/repos/${owner}/${repo}/issues/${issueNumber}`,
+		);
+		return { title: response.data.title, url: response.data.html_url };
+	} catch (error) {
+		if (axios.isAxiosError(error) && error.response?.status === 404) {
+			return null;
+		}
+		throw error;
+	}
+}
+
 export async function createIssue(
 	title: string,
 	body: string,
 	imageUrls?: string[],
 ): Promise<{ url: string; number: number }> {
-	const [owner, repo] = env.GITHUB_REPO.split("/");
-	const fullBody =
-		imageUrls?.length
-			? `${body}\n\n${imageUrls.map((u) => `![image](${u})`).join("\n")}`
-			: body;
 	const response = await api.post(`/repos/${owner}/${repo}/issues`, {
 		title,
-		body: fullBody,
+		body: appendImages(body, imageUrls),
 	});
 	return { url: response.data.html_url, number: response.data.number };
+}
+
+export async function addComment(
+	issueNumber: number,
+	body: string,
+	imageUrls?: string[],
+): Promise<{ url: string }> {
+	const response = await api.post(
+		`/repos/${owner}/${repo}/issues/${issueNumber}/comments`,
+		{ body: appendImages(body, imageUrls) },
+	);
+	return { url: response.data.html_url };
 }
