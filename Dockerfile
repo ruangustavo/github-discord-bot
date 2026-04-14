@@ -2,6 +2,7 @@
 
 FROM oven/bun:1-alpine AS base
 WORKDIR /app
+RUN apk add --no-cache github-cli
 
 # Install production dependencies only
 FROM base AS deps

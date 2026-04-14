@@ -69,6 +69,20 @@ function buildCommentEmbed(
 		.setFooter({ text: `Comentário adicionado na Issue #${issueNumber}` });
 }
 
+function buildUpdateEmbed(
+	issueTitle: string,
+	url: string,
+	issueNumber: number,
+	summary: string,
+): EmbedBuilder {
+	return new EmbedBuilder()
+		.setTitle(issueTitle)
+		.setDescription(summary)
+		.setURL(url)
+		.setColor(0x2da44e)
+		.setFooter({ text: `Issue #${issueNumber}` });
+}
+
 interface RequestContext {
 	content: string;
 	imageUrls: string[];
@@ -89,6 +103,11 @@ async function handleRequest(ctx: RequestContext): Promise<void> {
 		case "comment_added":
 			await ctx.sendEmbed(
 				buildCommentEmbed(result.issueTitle, result.url, result.issueNumber),
+			);
+			break;
+		case "issue_updated":
+			await ctx.sendEmbed(
+				buildUpdateEmbed(result.issueTitle, result.url, result.issueNumber, result.summary),
 			);
 			break;
 		case "refused":

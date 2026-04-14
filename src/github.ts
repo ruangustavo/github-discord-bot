@@ -1,59 +1,53 @@
 import axios from "axios";
-import { env } from "./env.ts";
 
-const api = axios.create({
-	baseURL: "https://api.github.com",
-	headers: {
-		Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-		Accept: "application/vnd.github+json",
-		"X-GitHub-Api-Version": "2022-11-28",
-	},
-});
-
-const [owner, repo] = env.GITHUB_REPO.split("/");
-
-function appendImages(body: string, imageUrls?: string[]): string {
-	return imageUrls?.length
-		? `${body}\n\n${imageUrls.map((u) => `![image](${u})`).join("\n")}`
-		: body;
-}
-
-export async function getIssue(
-	issueNumber: number,
-): Promise<{ title: string; url: string } | null> {
-	try {
-		const response = await api.get(
-			`/repos/${owner}/${repo}/issues/${issueNumber}`,
-		);
-		return { title: response.data.title, url: response.data.html_url };
-	} catch (error) {
-		if (axios.isAxiosError(error) && error.response?.status === 404) {
-			return null;
-		}
-		throw error;
-	}
-}
-
-export async function createIssue(
-	title: string,
-	body: string,
-	imageUrls?: string[],
-): Promise<{ url: string; number: number }> {
-	const response = await api.post(`/repos/${owner}/${repo}/issues`, {
-		title,
-		body: appendImages(body, imageUrls),
+export function createGitHubClient(token: string) {
+	const client = axios.create({
+		baseURL: "https://api.github.com",
+		headers: {
+			Authorization: `Bearer ${token}`,
+			Accept: "application/vnd.github+json",
+			"X-GitHub-Api-Version": "2022-11-28",
+		},
 	});
-	return { url: response.data.html_url, number: response.data.number };
-}
 
-export async function addComment(
-	issueNumber: number,
-	body: string,
-	imageUrls?: string[],
-): Promise<{ url: string }> {
-	const response = await api.post(
-		`/repos/${owner}/${repo}/issues/${issueNumber}/comments`,
-		{ body: appendImages(body, imageUrls) },
-	);
-	return { url: response.data.html_url };
+	async function fetchCollaborators(repo: string): Promise<string[]> {
+		try {
+			const [owner, name] = repo.split("/");
+			const { data } = await client.get<{ login: string }[]>(
+				`/repos/${owner}/${name}/collaborators`,
+				{ params: { per_page: 100 } },
+			);
+			return data.map((c) => c.login);
+		} catch {
+			return [];
+		}
+	}
+
+	async function fetchLabels(repo: string): Promise<string[]> {
+		try {
+			const [owner, name] = repo.split("/");
+			const { data } = await client.get<{ name: string }[]>(
+				`/repos/${owner}/${name}/labels`,
+				{ params: { per_page: 100 } },
+			);
+			return data.map((l) => l.name);
+		} catch {
+			return [];
+		}
+	}
+
+	async function fetchMilestones(repo: string): Promise<string[]> {
+		try {
+			const [owner, name] = repo.split("/");
+			const { data } = await client.get<{ title: string }[]>(
+				`/repos/${owner}/${name}/milestones`,
+				{ params: { per_page: 100 } },
+			);
+			return data.map((m) => m.title);
+		} catch {
+			return [];
+		}
+	}
+
+	return { fetchCollaborators, fetchLabels, fetchMilestones };
 }
