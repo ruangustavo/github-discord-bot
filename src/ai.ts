@@ -1,37 +1,29 @@
 import { openai } from "@ai-sdk/openai";
 import { hasToolCall, stepCountIs, ToolLoopAgent, tool } from "ai";
 import { z } from "zod";
-import { cache, isCacheValid } from "./cache.ts";
+import { cache, getCached } from "./cache.ts";
 import { env } from "./env.ts";
 import { createGitHubClient } from "./github.ts";
 
 const model = openai("gpt-4o-mini");
 const github = createGitHubClient(env.GH_TOKEN);
 
-async function getCollaborators(): Promise<string[]> {
-	if (cache.collaborators && isCacheValid(cache.collaborators))
-		return cache.collaborators.data;
+const ISSUE_URL_PATTERN = /\/issues\/(\d+)/;
 
-	const data = await github.fetchCollaborators(env.GITHUB_REPO);
-	cache.collaborators = { data, fetchedAt: Date.now() };
-	return data;
-}
-
-async function getLabels(): Promise<string[]> {
-	if (cache.labels && isCacheValid(cache.labels)) return cache.labels.data;
-
-	const data = await github.fetchLabels(env.GITHUB_REPO);
-	cache.labels = { data, fetchedAt: Date.now() };
-	return data;
-}
-
-async function getMilestones(): Promise<string[]> {
-	if (cache.milestones && isCacheValid(cache.milestones))
-		return cache.milestones.data;
-
-	const data = await github.fetchMilestones(env.GITHUB_REPO);
-	cache.milestones = { data, fetchedAt: Date.now() };
-	return data;
+async function spawnGh(args: string[]): Promise<string> {
+	const proc = Bun.spawn(["gh", ...args], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	if (exitCode !== 0) {
+		throw new Error(stderr.trim() || `gh encerrou com código ${exitCode}`);
+	}
+	return stdout.trim();
 }
 
 function buildSystemPrompt(context: {
@@ -91,7 +83,15 @@ Regras de eficiência:
 - Execute APENAS as ações solicitadas pelo usuário. NÃO invente ações adicionais (como comentários ou edições não pedidas).
 - NUNCA execute ações em paralelo quando uma depende do resultado da outra. Ex: se precisa criar uma issue e depois comentar nela, PRIMEIRO crie a issue, AGUARDE o número retornado, e SÓ ENTÃO comente.
 - Quando "gh issue close" retorna uma URL, a issue foi fechada com sucesso. NÃO verifique listando issues novamente. Após executar todas as ações, chame "respond" imediatamente.
-- NUNCA liste issues para verificar se uma ação funcionou. Confie no resultado do comando.`;
+- NUNCA liste issues para verificar se uma ação funcionou. Confie no resultado do comando.
+
+Regras para sub-issues:
+- Use a ferramenta "subIssue" quando o pedido envolver parent issue, child issue, sub-issue, issue filha ou hierarquia entre issues.
+- Para criar sub-issue, use action "create".
+- Para vincular issue existente como sub-issue, use action "add".
+- Para listar sub-issues de uma issue pai, use action "list".
+- Para remover o vínculo entre pai e filha, use action "remove".
+- Não use "gh api graphql" para sub-issues quando a ferramenta "subIssue" atender o pedido.`;
 }
 
 export type RequestResult =
@@ -110,9 +110,11 @@ export async function processRequest(
 	imageUrls: string[] = [],
 ): Promise<RequestResult> {
 	const [collaborators, labels, milestones] = await Promise.all([
-		getCollaborators(),
-		getLabels(),
-		getMilestones(),
+		getCached("collaborators", () =>
+			github.fetchCollaborators(env.GITHUB_REPO),
+		),
+		getCached("labels", () => github.fetchLabels(env.GITHUB_REPO)),
+		getCached("milestones", () => github.fetchMilestones(env.GITHUB_REPO)),
 	]);
 
 	const systemPrompt = buildSystemPrompt({
@@ -126,83 +128,107 @@ export async function processRequest(
 			? `\n\nImagens anexadas:\n${imageUrls.map((u) => `![image](${u})`).join("\n")}`
 			: "";
 
-	const ghTool = tool({
-		description: `Executa comandos do GitHub CLI para gerenciamento de issues.
-Subcomandos permitidos: "issue", "label", "api".
-O --repo é injetado automaticamente em comandos "issue" e "label" — não inclua --repo nesses args.
-Para "api", especifique o caminho completo (ex: repos/:owner/:repo/milestones).
+	const runIssueCommand = async (args: string[]) => {
+		const output = await spawnGh(["issue", ...args, "--repo", env.GITHUB_REPO]);
 
-Exemplos:
-  ["issue", "list"]
-  ["issue", "view", "42", "--json", "title,url"]
-  ["issue", "create", "--title", "Bug: login", "--body", "Passos...", "--assignee", "user", "--label", "bug"]
-  ["issue", "comment", "42", "--body", "Investigar na próxima sprint"]
-  ["issue", "close", "42"]
-  ["issue", "reopen", "42"]
-  ["issue", "edit", "42", "--add-assignee", "ruangustavo", "--add-label", "bug"]
-  ["issue", "edit", "42", "--milestone", "v1.0"]
-  ["label", "list", "--json", "name", "--jq", ".[].name"]
-  ["label", "create", "priority-high", "--color", "#e11d48"]
-  ["api", "repos/:owner/:repo/milestones", "--jq", ".[].title"]
-  ["api", "repos/:owner/:repo/milestones", "-f", "title=v2.0", "--method", "POST"]`,
+		const match = output.match(ISSUE_URL_PATTERN);
+
+		if (!match) {
+			throw new Error(
+				"Não foi possível identificar a issue retornada pelo GitHub",
+			);
+		}
+
+		return {
+			url: output,
+			number: Number(match[1]),
+		};
+	};
+
+	const subIssueTool = tool({
+		description: `Executa operações determinísticas de sub-issues.
+
+Ações disponíveis:
+  - add: vincula uma issue existente a uma issue pai
+  - create: cria uma nova issue e a vincula como sub-issue
+  - list: lista as sub-issues de uma issue pai
+  - remove: remove o vínculo entre issue pai e sub-issue`,
 		inputSchema: z.object({
-			args: z
-				.array(z.string())
-				.describe(
-					'Argumentos após "gh", ex: ["issue", "create", "--title", "..."]',
-				),
+			action: z.enum(["add", "create", "list", "remove"]),
+			parentIssueNumber: z.number().int().positive(),
+			childIssueNumber: z.number().int().positive().optional(),
+			title: z.string().optional(),
+			body: z.string().optional(),
+			labels: z.array(z.string()).optional(),
+			assignees: z.array(z.string()).optional(),
+			milestone: z.string().optional(),
 		}),
-		execute: async ({ args }) => {
-			const subcommand = args[0] ?? "";
-			const subaction = args[1] ?? "";
-			if (!ALLOWED_SUBCOMMANDS.includes(subcommand as AllowedSubcommand)) {
-				return {
-					error: `Subcommand "${subcommand}" não permitido. Use apenas: ${ALLOWED_SUBCOMMANDS.join(", ")}.`,
-				};
-			}
+		execute: async (input) => {
+			try {
+				switch (input.action) {
+					case "add": {
+						if (!input.childIssueNumber) {
+							return { error: "childIssueNumber é obrigatório para add." };
+						}
+						return await github.addSubIssue(
+							env.GITHUB_REPO,
+							input.parentIssueNumber,
+							input.childIssueNumber,
+						);
+					}
+					case "create": {
+						if (!input.title) {
+							return { error: "title é obrigatório para create." };
+						}
+						const args = ["create", "--title", input.title];
+						if (input.body) args.push("--body", input.body);
+						for (const label of input.labels ?? []) args.push("--label", label);
+						for (const assignee of input.assignees ?? [])
+							args.push("--assignee", assignee);
+						if (input.milestone) args.push("--milestone", input.milestone);
 
-			const cmd =
-				subcommand === "api"
-					? ["gh", ...args]
-					: ["gh", ...args, "--repo", env.GITHUB_REPO];
-
-			const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
-			const [stdout, stderr, exitCode] = await Promise.all([
-				new Response(proc.stdout).text(),
-				new Response(proc.stderr).text(),
-				proc.exited,
-			]);
-			if (exitCode !== 0) {
-				return { error: stderr.trim() || `gh encerrou com código ${exitCode}` };
-			}
-
-			const output = stdout.trim();
-
-			// Parse URL from issue create/close/reopen to return structured data
-			if (
-				subcommand === "issue" &&
-				["create", "close", "reopen"].includes(subaction)
-			) {
-				const match = output.match(/\/issues\/(\d+)/);
-				if (match) {
-					return { url: output, number: Number(match[1]) };
+						const created = await runIssueCommand(args);
+						await github.addSubIssue(
+							env.GITHUB_REPO,
+							input.parentIssueNumber,
+							created.number,
+						);
+						return {
+							parentNumber: input.parentIssueNumber,
+							childNumber: created.number,
+							url: created.url,
+						};
+					}
+					case "list": {
+						const result = await github.listSubIssues(
+							env.GITHUB_REPO,
+							input.parentIssueNumber,
+						);
+						return {
+							...result,
+							total: result.subIssues.length,
+							openCount: result.subIssues.filter((i) => i.state === "open")
+								.length,
+						};
+					}
+					case "remove": {
+						if (!input.childIssueNumber) {
+							return { error: "childIssueNumber é obrigatório para remove." };
+						}
+						return await github.removeSubIssue(
+							env.GITHUB_REPO,
+							input.parentIssueNumber,
+							input.childIssueNumber,
+						);
+					}
 				}
+			} catch (error) {
+				const message =
+					error instanceof Error
+						? error.message
+						: "Erro ao processar sub-issue.";
+				return { error: message };
 			}
-
-			// Invalidate cache on mutations
-			if (
-				subcommand === "label" &&
-				LABEL_MUTATION_ACTIONS.includes(subaction as LabelMutationAction)
-			) {
-				delete cache.labels;
-			} else if (
-				subcommand === "api" &&
-				args.some((a) => a.includes("milestones"))
-			) {
-				delete cache.milestones;
-			}
-
-			return { output };
 		},
 	});
 
@@ -229,7 +255,7 @@ Exemplos:
 	const agent = new ToolLoopAgent({
 		model,
 		instructions: systemPrompt,
-		tools: { gh: ghTool, respond: respondTool },
+		tools: { gh: ghTool, subIssue: subIssueTool, respond: respondTool },
 		stopWhen: [hasToolCall("respond"), stepCountIs(20)],
 		onStepFinish(step) {
 			console.log(`[ai] step ${step.stepNumber}`);
