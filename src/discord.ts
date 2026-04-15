@@ -41,46 +41,19 @@ export async function registerCommands(clientId: string): Promise<void> {
 	});
 }
 
-function buildIssueEmbed(
-	title: string,
-	description: string,
-	url: string,
-	number: number,
-): EmbedBuilder {
-	const preview =
-		description.length > 300 ? `${description.slice(0, 300)}...` : description;
-	return new EmbedBuilder()
-		.setTitle(title)
-		.setDescription(preview)
-		.setURL(url)
-		.setColor(0x2da44e)
-		.setFooter({ text: `Issue #${number}` });
+function buildActionEmbed(title: string, body?: string, url?: string): EmbedBuilder {
+	const embed = new EmbedBuilder().setTitle(title).setColor(0x2da44e);
+	if (body) {
+		const preview = body.length > 300 ? `${body.slice(0, 300)}...` : body;
+		embed.setDescription(preview);
+	}
+	if (url) embed.setURL(url);
+	return embed;
 }
 
-function buildCommentEmbed(
-	issueTitle: string,
-	commentUrl: string,
-	issueNumber: number,
-): EmbedBuilder {
-	return new EmbedBuilder()
-		.setTitle(issueTitle)
-		.setURL(commentUrl)
-		.setColor(0x2da44e)
-		.setFooter({ text: `Comentário adicionado na Issue #${issueNumber}` });
-}
-
-function buildUpdateEmbed(
-	issueTitle: string,
-	url: string,
-	issueNumber: number,
-	summary: string,
-): EmbedBuilder {
-	return new EmbedBuilder()
-		.setTitle(issueTitle)
-		.setDescription(summary)
-		.setURL(url)
-		.setColor(0x2da44e)
-		.setFooter({ text: `Issue #${issueNumber}` });
+function buildListEmbed(title: string, body: string): EmbedBuilder {
+	const preview = body.length > 4000 ? `${body.slice(0, 4000)}...` : body;
+	return new EmbedBuilder().setTitle(title).setDescription(preview).setColor(0x2da44e);
 }
 
 interface RequestContext {
@@ -95,20 +68,11 @@ async function handleRequest(ctx: RequestContext): Promise<void> {
 	await ctx.sendTyping();
 	const result = await processRequest(ctx.content, ctx.imageUrls);
 	switch (result.type) {
-		case "issue_created":
-			await ctx.sendEmbed(
-				buildIssueEmbed(result.title, result.description, result.url, result.number),
-			);
+		case "action":
+			await ctx.sendEmbed(buildActionEmbed(result.title, result.body, result.url));
 			break;
-		case "comment_added":
-			await ctx.sendEmbed(
-				buildCommentEmbed(result.issueTitle, result.url, result.issueNumber),
-			);
-			break;
-		case "issue_updated":
-			await ctx.sendEmbed(
-				buildUpdateEmbed(result.issueTitle, result.url, result.issueNumber, result.summary),
-			);
+		case "list":
+			await ctx.sendEmbed(buildListEmbed(result.title, result.body));
 			break;
 		case "refused":
 			await ctx.sendMessage(result.reason);

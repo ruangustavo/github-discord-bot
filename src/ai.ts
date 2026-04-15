@@ -1,5 +1,5 @@
 import { openai } from "@ai-sdk/openai";
-import { hasToolCall, ToolLoopAgent, tool } from "ai";
+import { hasToolCall, stepCountIs, ToolLoopAgent, tool } from "ai";
 import { z } from "zod";
 import { cache, isCacheValid } from "./cache.ts";
 import { env } from "./env.ts";
@@ -62,48 +62,41 @@ Fluxo de trabalho:
 2. Use a ferramenta "gh" quantas vezes precisar para executar a ação adequada.
 3. Ao terminar, chame OBRIGATORIAMENTE a ferramenta "respond" com o resultado.
 
-Ações suportadas:
-- Criar issue: gh issue create --title "..." --body "..." --json number,url (ação PADRÃO)
-- Comentar em issue: primeiro gh issue view NÚMERO --json title,url, depois gh issue comment NÚMERO --body "..."
-- Fechar/reabrir issue: primeiro gh issue view NÚMERO --json title,url, depois gh issue close/reopen NÚMERO
-- Editar issue (título, corpo): primeiro gh issue view NÚMERO --json title,url, depois gh issue edit NÚMERO --title "..." --body "..."
-- Atribuir colaborador: primeiro gh issue view NÚMERO --json title,url, depois gh issue edit NÚMERO --add-assignee USUÁRIO
-- Adicionar/remover label: primeiro gh issue view NÚMERO --json title,url, depois gh issue edit NÚMERO --add-label NOME / --remove-label NOME
-- Definir milestone: primeiro gh issue view NÚMERO --json title,url, depois gh issue edit NÚMERO --milestone NOME
-- Listar issues: gh issue list
-- Criar label: gh label create NOME --color "#hex" --repo REPO
-- Gerenciar milestones: gh api repos/:owner/:repo/milestones (GET para listar, POST -f title="..." para criar)
+Formato de referência a issues:
+- No campo "title": use texto simples com o número da issue, ex: "Issue #5 fechada", "Issue #7 criada". NÃO use markdown no title.
+- No campo "body": SEMPRE referencie issues com link markdown: Texto [#N](URL). Ex: "Label 'bug' adicionada à issue [#3](https://github.com/owner/repo/issues/3)".
+- "issue create" retorna { url, number } automaticamente. Para consultas, use --json url.
+
+Formas de resposta:
+- "action": algo foi feito (criar, fechar, reabrir, comentar, editar, atribuir, label, milestone, etc.).
+  - title: título claro da ação em texto simples, ex: "Issue #5 fechada", "Label 'bug' adicionada à Issue #3", "Issue #7 criada".
+  - body: opcional, use para o corpo da issue criada ou um resumo relevante em Markdown. Referencie issues com [#N](URL).
+  - url: SEMPRE inclua a URL da issue quando disponível. O title inteiro se torna clicável através desse campo.
+- "list": resultados de uma consulta (listar issues, labels, milestones, etc.).
+  - title: nome da listagem, ex: "Issues abertas", "Labels disponíveis".
+  - body: lista formatada em Markdown. Cada issue deve seguir o formato: Título da issue [#N](URL).
+- "refused": conteúdo completamente fora do escopo de gerenciamento de issues no GitHub.
+  - reason: motivo da recusa.
 
 Regras:
 - Criar issue é a ação PADRÃO para qualquer conteúdo acionável (bug, funcionalidade, problema, dúvida).
 - Use os colaboradores, labels e milestones do contexto acima ao interpretar referências por nome.
 - Ao criar uma issue: gere título conciso e descrição sucinta em Markdown, ambos em português. Reorganize as ideias sem expandir escopo.
-- Para ações em issues existentes: sempre busque title e url antes de chamar respond.
 - Recuse APENAS se o conteúdo for completamente fora do escopo de gerenciamento de issues.
-- Se houver URLs de imagens na mensagem, inclua-as no corpo como markdown: ![image](URL)`;
+- Se houver URLs de imagens na mensagem, inclua-as no corpo como markdown: ![image](URL)
+
+Regras de eficiência:
+- Combine TODOS os flags em uma ÚNICA chamada. Ex: ["issue", "create", "--title", "...", "--body", "...", "--assignee", "user", "--label", "bug"]
+- "issue create" NÃO suporta --json. O resultado já retorna { url, number } automaticamente. NUNCA repita o comando de criação.
+- Execute APENAS as ações solicitadas pelo usuário. NÃO invente ações adicionais (como comentários ou edições não pedidas).
+- NUNCA execute ações em paralelo quando uma depende do resultado da outra. Ex: se precisa criar uma issue e depois comentar nela, PRIMEIRO crie a issue, AGUARDE o número retornado, e SÓ ENTÃO comente.
+- Quando "gh issue close" retorna uma URL, a issue foi fechada com sucesso. NÃO verifique listando issues novamente. Após executar todas as ações, chame "respond" imediatamente.
+- NUNCA liste issues para verificar se uma ação funcionou. Confie no resultado do comando.`;
 }
 
 export type RequestResult =
-	| {
-			type: "issue_created";
-			title: string;
-			description: string;
-			url: string;
-			number: number;
-	  }
-	| {
-			type: "comment_added";
-			issueTitle: string;
-			url: string;
-			issueNumber: number;
-	  }
-	| {
-			type: "issue_updated";
-			issueTitle: string;
-			url: string;
-			issueNumber: number;
-			summary: string;
-	  }
+	| { type: "action"; title: string; body?: string; url?: string }
+	| { type: "list"; title: string; body: string }
 	| { type: "refused"; reason: string };
 
 const ALLOWED_SUBCOMMANDS = ["issue", "label", "api"] as const;
@@ -116,15 +109,17 @@ export async function processRequest(
 	content: string,
 	imageUrls: string[] = [],
 ): Promise<RequestResult> {
-	let result: RequestResult | null = null;
-
 	const [collaborators, labels, milestones] = await Promise.all([
 		getCollaborators(),
 		getLabels(),
 		getMilestones(),
 	]);
 
-	const systemPrompt = buildSystemPrompt({ collaborators, labels, milestones });
+	const systemPrompt = buildSystemPrompt({
+		collaborators,
+		labels,
+		milestones,
+	});
 
 	const imageContext =
 		imageUrls.length > 0
@@ -136,10 +131,11 @@ export async function processRequest(
 Subcomandos permitidos: "issue", "label", "api".
 O --repo é injetado automaticamente em comandos "issue" e "label" — não inclua --repo nesses args.
 Para "api", especifique o caminho completo (ex: repos/:owner/:repo/milestones).
+
 Exemplos:
   ["issue", "list"]
   ["issue", "view", "42", "--json", "title,url"]
-  ["issue", "create", "--title", "Bug: login quebrado", "--body", "Passos...", "--json", "number,url"]
+  ["issue", "create", "--title", "Bug: login", "--body", "Passos...", "--assignee", "user", "--label", "bug"]
   ["issue", "comment", "42", "--body", "Investigar na próxima sprint"]
   ["issue", "close", "42"]
   ["issue", "reopen", "42"]
@@ -180,6 +176,19 @@ Exemplos:
 				return { error: stderr.trim() || `gh encerrou com código ${exitCode}` };
 			}
 
+			const output = stdout.trim();
+
+			// Parse URL from issue create/close/reopen to return structured data
+			if (
+				subcommand === "issue" &&
+				["create", "close", "reopen"].includes(subaction)
+			) {
+				const match = output.match(/\/issues\/(\d+)/);
+				if (match) {
+					return { url: output, number: Number(match[1]) };
+				}
+			}
+
 			// Invalidate cache on mutations
 			if (
 				subcommand === "label" &&
@@ -193,7 +202,7 @@ Exemplos:
 				delete cache.milestones;
 			}
 
-			return { output: stdout.trim() };
+			return { output };
 		},
 	});
 
@@ -201,94 +210,72 @@ Exemplos:
 		description:
 			"Chame esta ferramenta ao terminar para reportar o resultado da ação. Sempre chame ao final.",
 		inputSchema: z.object({
-			action: z.enum([
-				"issue_created",
-				"comment_added",
-				"issue_updated",
-				"refused",
-			]),
-			title: z
-				.string()
-				.optional()
-				.describe("Título da issue (para issue_created)"),
-			description: z
-				.string()
-				.optional()
-				.describe("Corpo da issue (para issue_created)"),
-			issueTitle: z
-				.string()
-				.optional()
-				.describe("Título da issue (para comment_added e issue_updated)"),
-			url: z.string().optional().describe("URL da issue ou comentário criado"),
-			number: z
-				.number()
-				.optional()
-				.describe("Número da issue (para issue_created)"),
-			issueNumber: z
-				.number()
-				.optional()
-				.describe("Número da issue (para comment_added e issue_updated)"),
-			summary: z
+			type: z.enum(["action", "list", "refused"]),
+			title: z.string().optional().describe("Título da ação ou da listagem"),
+			body: z
 				.string()
 				.optional()
 				.describe(
-					'Resumo curto da ação realizada (para issue_updated), ex: "Issue fechada", "Label \'bug\' adicionada", "Atribuído a ruangustavo"',
+					"Corpo em Markdown: descrição da issue criada, resumo relevante, ou lista formatada",
 				),
+			url: z
+				.string()
+				.optional()
+				.describe("URL da issue ou comentário (quando disponível)"),
 			reason: z.string().optional().describe("Motivo da recusa (para refused)"),
 		}),
-		execute: async (input) => {
-			switch (input.action) {
-				case "issue_created":
-					result = {
-						type: "issue_created",
-						title: input.title ?? "",
-						description: input.description ?? "",
-						url: input.url ?? "",
-						number: input.number ?? 0,
-					};
-					break;
-				case "comment_added":
-					result = {
-						type: "comment_added",
-						issueTitle: input.issueTitle ?? "",
-						url: input.url ?? "",
-						issueNumber: input.issueNumber ?? 0,
-					};
-					break;
-				case "issue_updated":
-					result = {
-						type: "issue_updated",
-						issueTitle: input.issueTitle ?? "",
-						url: input.url ?? "",
-						issueNumber: input.issueNumber ?? 0,
-						summary: input.summary ?? "",
-					};
-					break;
-				case "refused":
-					result = {
-						type: "refused",
-						reason: input.reason ?? "Não consigo processar essa solicitação.",
-					};
-					break;
-			}
-			return { ok: true };
-		},
 	});
 
 	const agent = new ToolLoopAgent({
 		model,
 		instructions: systemPrompt,
 		tools: { gh: ghTool, respond: respondTool },
-		stopWhen: hasToolCall("respond"),
+		stopWhen: [hasToolCall("respond"), stepCountIs(20)],
+		onStepFinish(step) {
+			console.log(`[ai] step ${step.stepNumber}`);
+			if (step.reasoningText)
+				console.log(`[ai] reasoning: ${step.reasoningText}`);
+			if (step.text) console.log(`[ai] text: ${step.text}`);
+			for (const call of step.toolCalls) {
+				console.log(`[ai] tool call: ${call.toolName}`, call.input);
+			}
+		},
 	});
 
-	await agent.generate({ prompt: content + imageContext });
+	const generation = await agent.generate({ prompt: content + imageContext });
 
-	return (
-		result ?? {
+	const respondCall = generation.staticToolCalls.find(
+		(c) => c.toolName === "respond",
+	);
+
+	if (!respondCall) {
+		return {
 			type: "refused",
 			reason:
 				"Não consigo processar essa solicitação. Por favor, forneça mais detalhes.",
-		}
-	);
+		};
+	}
+
+	const input = respondCall.input;
+
+	switch (input.type) {
+		case "action":
+			return {
+				type: "action",
+				title: input.title ?? "",
+				body: input.body,
+				url: input.url,
+			};
+		case "list":
+			return {
+				type: "list",
+				title: input.title ?? "",
+				body: input.body ?? "",
+			};
+		case "refused":
+			return {
+				type: "refused",
+				reason: input.reason ?? "Não consigo processar essa solicitação.",
+			};
+	}
 }
