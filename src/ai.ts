@@ -81,6 +81,7 @@ Regras de eficiência:
 - Combine TODOS os flags em uma ÚNICA chamada. Ex: ["issue", "create", "--title", "...", "--body", "...", "--assignee", "user", "--label", "bug"]
 - "issue create" NÃO suporta --json. O resultado já retorna { url, number } automaticamente. NUNCA repita o comando de criação.
 - Execute APENAS as ações solicitadas pelo usuário. NÃO invente ações adicionais (como comentários ou edições não pedidas).
+- NÃO adicione labels proativamente. SÓ adicione labels quando o usuário pedir explicitamente.
 - NUNCA execute ações em paralelo quando uma depende do resultado da outra. Ex: se precisa criar uma issue e depois comentar nela, PRIMEIRO crie a issue, AGUARDE o número retornado, e SÓ ENTÃO comente.
 - Quando "gh issue close" retorna uma URL, a issue foi fechada com sucesso. NÃO verifique listando issues novamente. Após executar todas as ações, chame "respond" imediatamente.
 - NUNCA liste issues para verificar se uma ação funcionou. Confie no resultado do comando.
