@@ -41,7 +41,11 @@ export async function registerCommands(clientId: string): Promise<void> {
 	});
 }
 
-function buildActionEmbed(title: string, body?: string, url?: string): EmbedBuilder {
+function buildActionEmbed(
+	title: string,
+	body?: string,
+	url?: string,
+): EmbedBuilder {
 	const embed = new EmbedBuilder().setTitle(title).setColor(0x2da44e);
 	if (body) {
 		const preview = body.length > 300 ? `${body.slice(0, 300)}...` : body;
@@ -53,7 +57,20 @@ function buildActionEmbed(title: string, body?: string, url?: string): EmbedBuil
 
 function buildListEmbed(title: string, body: string): EmbedBuilder {
 	const preview = body.length > 4000 ? `${body.slice(0, 4000)}...` : body;
-	return new EmbedBuilder().setTitle(title).setDescription(preview).setColor(0x2da44e);
+	return new EmbedBuilder()
+		.setTitle(title)
+		.setDescription(preview)
+		.setColor(0x2da44e);
+}
+
+function getImageUrls(
+	...attachmentGroups: Iterable<{ contentType?: string | null; url: string }>[]
+): string[] {
+	return attachmentGroups.flatMap((attachments) =>
+		[...attachments]
+			.filter((attachment) => attachment.contentType?.startsWith("image/"))
+			.map((attachment) => attachment.url),
+	);
 }
 
 interface RequestContext {
@@ -69,7 +86,9 @@ async function handleRequest(ctx: RequestContext): Promise<void> {
 	const result = await processRequest(ctx.content, ctx.imageUrls);
 	switch (result.type) {
 		case "action":
-			await ctx.sendEmbed(buildActionEmbed(result.title, result.body, result.url));
+			await ctx.sendEmbed(
+				buildActionEmbed(result.title, result.body, result.url),
+			);
 			break;
 		case "list":
 			await ctx.sendEmbed(buildListEmbed(result.title, result.body));
@@ -83,46 +102,32 @@ async function handleRequest(ctx: RequestContext): Promise<void> {
 export function setupEvents(client: Client): void {
 	client.on(Events.MessageCreate, async (message) => {
 		if (message.author.bot) return;
-		if (!message.mentions.has(client.user ?? "")) return;
+		const clientId = client.user?.id;
+		if (!clientId || !message.mentions.has(clientId)) return;
 
-		const userNote = message.content
-			.replace(`<@${client.user?.id}>`, "")
-			.trim();
+		const userNote = message.content.replace(`<@${clientId}>`, "").trim();
 
-		let content: string;
-		const imageUrls: string[] = [];
+		const referenced = message.reference
+			? await message.fetchReference().catch(() => null)
+			: null;
 
-		if (message.reference) {
-			const referenced = await message.fetchReference().catch(() => null);
-			if (referenced) {
-				content = [
+		const content = referenced
+			? [
 					`Mensagem original: ${referenced.content}`,
 					userNote ? `Nota do usuário: ${userNote}` : null,
 				]
 					.filter(Boolean)
-					.join("\n");
-				imageUrls.push(
-					...[...referenced.attachments.values(), ...message.attachments.values()]
-						.filter((a) => a.contentType?.startsWith("image/"))
-						.map((a) => a.url),
-				);
-			} else {
-				content = userNote;
-				imageUrls.push(
-					...[...message.attachments.values()]
-						.filter((a) => a.contentType?.startsWith("image/"))
-						.map((a) => a.url),
-				);
-			}
-		} else {
-			if (!userNote) return;
-			content = userNote;
-			imageUrls.push(
-				...[...message.attachments.values()]
-					.filter((a) => a.contentType?.startsWith("image/"))
-					.map((a) => a.url),
-			);
-		}
+					.join("\n")
+			: userNote;
+
+		if (!referenced && !content) return;
+
+		const imageUrls = referenced
+			? getImageUrls(
+					referenced.attachments.values(),
+					message.attachments.values(),
+				)
+			: getImageUrls(message.attachments.values());
 
 		try {
 			await handleRequest({
@@ -155,8 +160,11 @@ export function setupEvents(client: Client): void {
 		if (interaction.commandName !== "create-issue") return;
 
 		await interaction.deferReply();
+
 		const content = interaction.options.getString("description", true);
+
 		const attachment = interaction.options.getAttachment("image");
+
 		const imageUrls = attachment?.contentType?.startsWith("image/")
 			? [attachment.url]
 			: [];
